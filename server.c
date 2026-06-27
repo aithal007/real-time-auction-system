@@ -12,6 +12,10 @@
 #define SERVER_PORT 8080
 #define BACKLOG 5
 
+static pthread_mutex_t auction_lock = PTHREAD_MUTEX_INITIALIZER;
+static Auction auctions[MAX_AUCTIONS];
+static int auction_count = 0;
+
 typedef struct {
     int sock;
 } ThreadArgs;
@@ -56,6 +60,28 @@ static void send_response(int client_sock, const char *message) {
     }
 }
 
+int create_auction(Auction auctions[], int *auction_count, const char *item, const char *seller, float start_bid, int duration) {
+    int new_id;
+
+    if (*auction_count >= MAX_AUCTIONS) {
+        return 0;
+    }
+
+    new_id = (*auction_count == 0) ? 1 : auctions[*auction_count - 1].id + 1;
+
+    auctions[*auction_count].id = new_id;
+    snprintf(auctions[*auction_count].item, sizeof(auctions[*auction_count].item), "%s", item);
+    snprintf(auctions[*auction_count].seller, sizeof(auctions[*auction_count].seller), "%s", seller);
+    auctions[*auction_count].currentBid = start_bid;
+    auctions[*auction_count].highestBidder[0] = '\0';
+    auctions[*auction_count].status = 1;
+    auctions[*auction_count].timeLeft = duration;
+
+    (*auction_count)++;
+
+    return save_auctions(auctions, *auction_count);
+}
+
 static void *handle_client(void *arg) {
     ThreadArgs *thread_args = (ThreadArgs *)arg;
     int client_sock = thread_args->sock;
@@ -63,6 +89,10 @@ static void *handle_client(void *arg) {
     Request req;
     char username[MAX_USERNAME];
     char password[MAX_PASSWORD];
+    char item[MAX_ITEM];
+    char seller[MAX_USERNAME];
+    float start_bid;
+    int duration;
 
     free(thread_args);
 
@@ -117,6 +147,25 @@ static void *handle_client(void *arg) {
                 }
                 break;
             case 3:
+                memset(item, 0, sizeof(item));
+                memset(seller, 0, sizeof(seller));
+                start_bid = 0.0f;
+                duration = 0;
+
+                if (sscanf(req.data, "%99s %49s %f %d", item, seller, &start_bid, &duration) == 4) {
+                    pthread_mutex_lock(&auction_lock);
+                    if (create_auction(auctions, &auction_count, item, seller, start_bid, duration)) {
+                        send_response(client_sock, "OK");
+                        printf("Auction created: %s by %s\n", item, seller);
+                    } else {
+                        send_response(client_sock, "FAIL");
+                        printf("Failed to create auction for %s\n", item);
+                    }
+                    pthread_mutex_unlock(&auction_lock);
+                } else {
+                    send_response(client_sock, "BAD_FORMAT");
+                    printf("Invalid create auction format\n");
+                }
                 break;
             case 4:
                 break;

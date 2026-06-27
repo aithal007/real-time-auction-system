@@ -71,6 +71,7 @@ int main(void) {
     char input[256];
     char username[MAX_USERNAME];
     char password[MAX_PASSWORD];
+    int running = 1;
 
     sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
@@ -99,37 +100,44 @@ int main(void) {
         printf("%s\n", buffer);
     }
 
-    show_menu();
-    read_line(input, sizeof(input));
-    if (sscanf(input, "%d", &choice) != 1) {
-        close(sock);
-        return 1;
-    }
+    while (running) {
+        show_menu();
+        read_line(input, sizeof(input));
+        if (sscanf(input, "%d", &choice) != 1) {
+            printf("Invalid choice\n");
+            continue;
+        }
 
-    memset(&req, 0, sizeof(req));
-    req.type = choice;
+        if (choice == 8) {
+            running = 0;
+            break;
+        }
 
-    if (choice == 1 || choice == 2) {
-        printf("Username: ");
-        read_line(username, sizeof(username));
+        memset(&req, 0, sizeof(req));
+        req.type = choice;
 
-        printf("Password: ");
-        read_line(password, sizeof(password));
+        if (choice == 1 || choice == 2) {
+            printf("Username: ");
+            read_line(username, sizeof(username));
 
-        snprintf(req.data, sizeof(req.data), "%s %s", username, password);
-    } else {
-        snprintf(req.data, sizeof(req.data), "choice=%d", choice);
-    }
+            printf("Password: ");
+            read_line(password, sizeof(password));
 
-    if (send_all(sock, &req, sizeof(req)) < 0) {
-        perror("send");
-        close(sock);
-        return 1;
-    }
+            snprintf(req.data, sizeof(req.data), "%s %s", username, password);
+        } else {
+            snprintf(req.data, sizeof(req.data), "choice=%d", choice);
+        }
 
-    memset(buffer, 0, sizeof(buffer));
-    if (recv_all(sock, buffer, sizeof(buffer)) == 0) {
-        printf("Server response: %s\n", buffer);
+        if (send_all(sock, &req, sizeof(req)) < 0) {
+            perror("send");
+            close(sock);
+            return 1;
+        }
+
+        memset(buffer, 0, sizeof(buffer));
+        if (recv_all(sock, buffer, sizeof(buffer)) == 0) {
+            printf("Server response: %s\n", buffer);
+        }
     }
 
     close(sock);
