@@ -60,6 +60,124 @@ static void send_response(int client_sock, const char *message) {
     }
 }
 
+static void view_auctions(int client_sock) {
+    char response[MAX_DATA];
+    size_t offset = 0;
+    int i;
+
+    memset(response, 0, sizeof(response));
+
+    if (auction_count == 0) {
+        snprintf(response, sizeof(response), "No auctions available");
+        send_response(client_sock, response);
+        return;
+    }
+
+    offset += (size_t)snprintf(response + offset, sizeof(response) - offset, "ID | Item | Seller | Bid | Bidder | Status | TimeLeft\n");
+    for (i = 0; i < auction_count && offset < sizeof(response); i++) {
+        offset += (size_t)snprintf(
+            response + offset,
+            sizeof(response) - offset,
+            "%d | %s | %s | %.2f | %s | %s | %d\n",
+            auctions[i].id,
+            auctions[i].item,
+            auctions[i].seller,
+            auctions[i].currentBid,
+            auctions[i].highestBidder[0] ? auctions[i].highestBidder : "-",
+            auctions[i].status ? "OPEN" : "ENDED",
+            auctions[i].timeLeft
+        );
+    }
+
+    send_response(client_sock, response);
+}
+
+static void view_my_auctions(int client_sock, const char *seller_name) {
+    char response[MAX_DATA];
+    size_t offset = 0;
+    int i;
+    int found = 0;
+
+    memset(response, 0, sizeof(response));
+
+    offset += (size_t)snprintf(response + offset, sizeof(response) - offset, "My Auctions for %s\n", seller_name);
+    offset += (size_t)snprintf(response + offset, sizeof(response) - offset, "ID | Item | Bid | Bidder | Status | TimeLeft\n");
+
+    for (i = 0; i < auction_count && offset < sizeof(response); i++) {
+        if (strcmp(auctions[i].seller, seller_name) == 0) {
+            found = 1;
+            offset += (size_t)snprintf(
+                response + offset,
+                sizeof(response) - offset,
+                "%d | %s | %.2f | %s | %s | %d\n",
+                auctions[i].id,
+                auctions[i].item,
+                auctions[i].currentBid,
+                auctions[i].highestBidder[0] ? auctions[i].highestBidder : "-",
+                auctions[i].status ? "OPEN" : "ENDED",
+                auctions[i].timeLeft
+            );
+        }
+    }
+
+    if (!found) {
+        snprintf(response, sizeof(response), "No auctions found for %s", seller_name);
+    }
+
+    send_response(client_sock, response);
+}
+
+static void view_winners(int client_sock) {
+    char response[MAX_DATA];
+    size_t offset = 0;
+    int i;
+    int found = 0;
+
+    memset(response, 0, sizeof(response));
+
+    offset += (size_t)snprintf(response + offset, sizeof(response) - offset, "Winners\n");
+    offset += (size_t)snprintf(response + offset, sizeof(response) - offset, "ID | Item | Winner | Bid\n");
+
+    for (i = 0; i < auction_count && offset < sizeof(response); i++) {
+        if (auctions[i].highestBidder[0] != '\0') {
+            found = 1;
+            offset += (size_t)snprintf(
+                response + offset,
+                sizeof(response) - offset,
+                "%d | %s | %s | %.2f\n",
+                auctions[i].id,
+                auctions[i].item,
+                auctions[i].highestBidder,
+                auctions[i].currentBid
+            );
+        }
+    }
+
+    if (!found) {
+        snprintf(response, sizeof(response), "No winners yet");
+    }
+
+    send_response(client_sock, response);
+}
+
+static int place_bid(int auction_id, const char *bidder, float amount) {
+    int i;
+
+    for (i = 0; i < auction_count; i++) {
+        if (auctions[i].id == auction_id) {
+            if (amount > auctions[i].currentBid) {
+                auctions[i].currentBid = amount;
+                snprintf(auctions[i].highestBidder, sizeof(auctions[i].highestBidder), "%s", bidder);
+                save_auctions(auctions, auction_count);
+                return 1;
+            }
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
 int create_auction(Auction auctions[], int *auction_count, const char *item, const char *seller, float start_bid, int duration) {
     int new_id;
 
@@ -93,6 +211,10 @@ static void *handle_client(void *arg) {
     char seller[MAX_USERNAME];
     float start_bid;
     int duration;
+    int auction_id;
+    char bidder[MAX_USERNAME];
+    float bid_amount;
+    char seller_filter[MAX_USERNAME];
 
     free(thread_args);
 
@@ -168,12 +290,50 @@ static void *handle_client(void *arg) {
                 }
                 break;
             case 4:
+                pthread_mutex_lock(&auction_lock);
+                view_auctions(client_sock);
+                pthread_mutex_unlock(&auction_lock);
                 break;
             case 5:
+                auction_id = 0;
+                memset(bidder, 0, sizeof(bidder));
+                bid_amount = 0.0f;
+
+                if (sscanf(req.data, "%d %49s %f", &auction_id, bidder, &bid_amount) == 3) {
+                    pthread_mutex_lock(&auction_lock);
+                    int result = place_bid(auction_id, bidder, bid_amount);
+                    pthread_mutex_unlock(&auction_lock);
+
+                    if (result == 1) {
+                        send_response(client_sock, "OK");
+                        printf("Bid accepted: %s on auction %d\n", bidder, auction_id);
+                    } else if (result == 0) {
+                        send_response(client_sock, "LOW_BID");
+                        printf("Bid too low from %s on auction %d\n", bidder, auction_id);
+                    } else {
+                        send_response(client_sock, "NOT_FOUND");
+                        printf("Auction %d not found for bid\n", auction_id);
+                    }
+                } else {
+                    send_response(client_sock, "BAD_FORMAT");
+                    printf("Invalid bid format\n");
+                }
                 break;
             case 6:
+                memset(seller_filter, 0, sizeof(seller_filter));
+                if (sscanf(req.data, "%49s", seller_filter) == 1) {
+                    pthread_mutex_lock(&auction_lock);
+                    view_my_auctions(client_sock, seller_filter);
+                    pthread_mutex_unlock(&auction_lock);
+                } else {
+                    send_response(client_sock, "BAD_FORMAT");
+                    printf("Invalid my auctions format\n");
+                }
                 break;
             case 7:
+                pthread_mutex_lock(&auction_lock);
+                view_winners(client_sock);
+                pthread_mutex_unlock(&auction_lock);
                 break;
             case 8:
                 break;
@@ -217,6 +377,10 @@ int main(void) {
         close(server_fd);
         return 1;
     }
+
+    pthread_mutex_lock(&auction_lock);
+    auction_count = load_auctions(auctions, MAX_AUCTIONS);
+    pthread_mutex_unlock(&auction_lock);
 
     printf("Server listening on port %d\n", SERVER_PORT);
 

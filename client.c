@@ -62,6 +62,59 @@ static void show_menu(void) {
     printf("Enter choice: ");
 }
 
+static void prompt_create_auction(Request *req) {
+    char item[MAX_ITEM];
+    char seller[MAX_USERNAME];
+    char input[256];
+    float start_bid;
+    int duration;
+
+    printf("Item name: ");
+    read_line(item, sizeof(item));
+
+    printf("Seller username: ");
+    read_line(seller, sizeof(seller));
+
+    printf("Starting bid: ");
+    read_line(input, sizeof(input));
+    start_bid = (float)atof(input);
+
+    printf("Duration (seconds): ");
+    read_line(input, sizeof(input));
+    duration = atoi(input);
+
+    snprintf(req->data, sizeof(req->data), "%s %s %.2f %d", item, seller, start_bid, duration);
+}
+
+static void prompt_place_bid(Request *req) {
+    char bidder[MAX_USERNAME];
+    char input[256];
+    int auction_id;
+    float amount;
+
+    printf("Auction ID: ");
+    read_line(input, sizeof(input));
+    auction_id = atoi(input);
+
+    printf("Bidder username: ");
+    read_line(bidder, sizeof(bidder));
+
+    printf("Bid amount: ");
+    read_line(input, sizeof(input));
+    amount = (float)atof(input);
+
+    snprintf(req->data, sizeof(req->data), "%d %s %.2f", auction_id, bidder, amount);
+}
+
+static void prompt_my_auctions(Request *req) {
+    char seller[MAX_USERNAME];
+
+    printf("Seller username: ");
+    read_line(seller, sizeof(seller));
+
+    snprintf(req->data, sizeof(req->data), "%s", seller);
+}
+
 int main(void) {
     int sock;
     struct sockaddr_in server_addr;
@@ -124,6 +177,12 @@ int main(void) {
             read_line(password, sizeof(password));
 
             snprintf(req.data, sizeof(req.data), "%s %s", username, password);
+        } else if (choice == 3) {
+            prompt_create_auction(&req);
+        } else if (choice == 5) {
+            prompt_place_bid(&req);
+        } else if (choice == 6) {
+            prompt_my_auctions(&req);
         } else {
             snprintf(req.data, sizeof(req.data), "choice=%d", choice);
         }
