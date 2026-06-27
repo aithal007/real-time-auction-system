@@ -7,14 +7,17 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "bid_processor.h"
 #include "common.h"
 
 #define SERVER_PORT 8080
 #define BACKLOG 5
+#define BIDS_FILE "data/bids.txt"
 
 static pthread_mutex_t auction_lock = PTHREAD_MUTEX_INITIALIZER;
 static Auction auctions[MAX_AUCTIONS];
 static int auction_count = 0;
+static BidProcessor bid_processor;
 
 typedef struct {
     int sock;
@@ -24,6 +27,12 @@ typedef struct {
     int auction_id;
     int duration;
 } TimerArgs;
+
+typedef struct {
+    int auction_id;
+    char bidder[MAX_USERNAME];
+    float amount;
+} BidEntry;
 
 static int send_all(int sock, const void *buffer, size_t length) {
     const char *ptr = (const char *)buffer;
@@ -65,6 +74,40 @@ static void send_response(int client_sock, const char *message) {
     }
 }
 
+static void log_bid(int auction_id, const char *bidder, float amount) {
+    FILE *fp = fopen(BIDS_FILE, "a");
+
+    if (!fp) {
+        perror("fopen");
+        return;
+    }
+
+    fprintf(fp, "%d %s %.2f\n", auction_id, bidder, amount);
+    fclose(fp);
+}
+
+static int find_highest_bid_for_auction(int auction_id, BidEntry *best_bid) {
+    FILE *fp = fopen(BIDS_FILE, "r");
+    BidEntry current;
+    int found = 0;
+
+    if (!fp) {
+        return 0;
+    }
+
+    while (fscanf(fp, "%d %49s %f", &current.auction_id, current.bidder, &current.amount) == 3) {
+        if (current.auction_id == auction_id) {
+            if (!found || current.amount > best_bid->amount) {
+                *best_bid = current;
+                found = 1;
+            }
+        }
+    }
+
+    fclose(fp);
+    return found;
+}
+
 static int find_auction_index(int auction_id) {
     int i;
 
@@ -77,10 +120,41 @@ static int find_auction_index(int auction_id) {
     return -1;
 }
 
+static int process_bid(const Bid *bid, void *ctx) {
+    (void)ctx;
+
+    int i = find_auction_index(bid->auction_id);
+
+    if (i < 0) {
+        return -1;
+    }
+
+    if (!auctions[i].status) {
+        return -2;
+    }
+
+    if (bid->amount > auctions[i].currentBid) {
+        auctions[i].currentBid = bid->amount;
+        snprintf(auctions[i].highestBidder, sizeof(auctions[i].highestBidder), "%s", bid->bidder);
+        log_bid(bid->auction_id, bid->bidder, bid->amount);
+        save_auctions(auctions, auction_count);
+        return 1;
+    }
+
+    return 0;
+}
+
 static void close_auction(int auction_id) {
     int index = find_auction_index(auction_id);
 
     if (index >= 0) {
+        BidEntry best_bid;
+
+        if (find_highest_bid_for_auction(auction_id, &best_bid)) {
+            auctions[index].currentBid = best_bid.amount;
+            snprintf(auctions[index].highestBidder, sizeof(auctions[index].highestBidder), "%s", best_bid.bidder);
+        }
+
         auctions[index].status = 0;
         auctions[index].timeLeft = 0;
         save_auctions(auctions, auction_count);
@@ -212,7 +286,7 @@ static void view_winners(int client_sock) {
     offset += (size_t)snprintf(response + offset, sizeof(response) - offset, "ID | Item | Winner | Bid\n");
 
     for (i = 0; i < auction_count && offset < sizeof(response); i++) {
-        if (auctions[i].highestBidder[0] != '\0') {
+        if (auctions[i].status == 0 && auctions[i].highestBidder[0] != '\0') {
             found = 1;
             offset += (size_t)snprintf(
                 response + offset,
@@ -234,24 +308,13 @@ static void view_winners(int client_sock) {
 }
 
 static int place_bid(int auction_id, const char *bidder, float amount) {
-    int i = find_auction_index(auction_id);
+    Bid bid;
 
-    if (i < 0) {
-        return -1;
-    }
+    bid.auction_id = auction_id;
+    snprintf(bid.bidder, sizeof(bid.bidder), "%s", bidder);
+    bid.amount = amount;
 
-    if (!auctions[i].status) {
-        return -2;
-    }
-
-    if (amount > auctions[i].currentBid) {
-        auctions[i].currentBid = amount;
-        snprintf(auctions[i].highestBidder, sizeof(auctions[i].highestBidder), "%s", bidder);
-        save_auctions(auctions, auction_count);
-        return 1;
-    }
-
-    return 0;
+    return bid_processor_submit(&bid_processor, &bid) ? 2 : 0;
 }
 
 int create_auction(Auction auctions[], int *auction_count, const char *item, const char *seller, float start_bid, int duration) {
@@ -395,22 +458,14 @@ static void *handle_client(void *arg) {
                 bid_amount = 0.0f;
 
                 if (sscanf(req.data, "%d %49s %f", &auction_id, bidder, &bid_amount) == 3) {
-                    pthread_mutex_lock(&auction_lock);
                     int result = place_bid(auction_id, bidder, bid_amount);
-                    pthread_mutex_unlock(&auction_lock);
 
-                    if (result == 1) {
-                        send_response(client_sock, "OK");
-                        printf("Bid accepted: %s on auction %d\n", bidder, auction_id);
-                    } else if (result == 0) {
-                        send_response(client_sock, "LOW_BID");
-                        printf("Bid too low from %s on auction %d\n", bidder, auction_id);
-                    } else if (result == -2) {
-                        send_response(client_sock, "CLOSED");
-                        printf("Auction %d is already closed\n", auction_id);
+                    if (result == 2) {
+                        send_response(client_sock, "QUEUED");
+                        printf("Bid queued: %s on auction %d\n", bidder, auction_id);
                     } else {
-                        send_response(client_sock, "NOT_FOUND");
-                        printf("Auction %d not found for bid\n", auction_id);
+                        send_response(client_sock, "FAIL");
+                        printf("Failed to queue bid for auction %d\n", auction_id);
                     }
                 } else {
                     send_response(client_sock, "BAD_FORMAT");
@@ -476,6 +531,12 @@ int main(void) {
         return 1;
     }
 
+    if (!bid_processor_init(&bid_processor, process_bid, NULL)) {
+        fprintf(stderr, "Failed to initialize bid processor\n");
+        close(server_fd);
+        return 1;
+    }
+
     pthread_mutex_lock(&auction_lock);
     auction_count = load_auctions(auctions, MAX_AUCTIONS);
     pthread_mutex_unlock(&auction_lock);
@@ -497,6 +558,13 @@ int main(void) {
                 }
             }
         }
+    }
+
+    if (!bid_processor_start(&bid_processor)) {
+        fprintf(stderr, "Failed to start bid processor\n");
+        bid_processor_destroy(&bid_processor);
+        close(server_fd);
+        return 1;
     }
 
     printf("Server listening on port %d\n", SERVER_PORT);
@@ -530,5 +598,6 @@ int main(void) {
     }
 
     close(server_fd);
+    bid_processor_destroy(&bid_processor);
     return 0;
 }
