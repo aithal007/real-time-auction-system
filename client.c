@@ -10,6 +10,45 @@
 
 #define SERVER_PORT 8080
 
+static int send_all(int sock, const void *buffer, size_t length) {
+    const char *ptr = (const char *)buffer;
+    size_t sent = 0;
+
+    while (sent < length) {
+        ssize_t n = send(sock, ptr + sent, length - sent, 0);
+        if (n <= 0) {
+            return -1;
+        }
+        sent += (size_t)n;
+    }
+
+    return 0;
+}
+
+static int recv_all(int sock, void *buffer, size_t length) {
+    char *ptr = (char *)buffer;
+    size_t received = 0;
+
+    while (received < length) {
+        ssize_t n = recv(sock, ptr + received, length - received, 0);
+        if (n <= 0) {
+            return -1;
+        }
+        received += (size_t)n;
+    }
+
+    return 0;
+}
+
+static void read_line(char *buffer, size_t size) {
+    if (fgets(buffer, size, stdin) == NULL) {
+        buffer[0] = '\0';
+        return;
+    }
+
+    buffer[strcspn(buffer, "\n")] = '\0';
+}
+
 static void show_menu(void) {
     puts("\n--- Auction System ---");
     puts("1. Login");
@@ -29,6 +68,9 @@ int main(void) {
     char buffer[256];
     Request req;
     int choice;
+    char input[256];
+    char username[MAX_USERNAME];
+    char password[MAX_PASSWORD];
 
     sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
@@ -53,24 +95,41 @@ int main(void) {
     }
 
     memset(buffer, 0, sizeof(buffer));
-    if (recv(sock, buffer, sizeof(buffer) - 1, 0) > 0) {
+    if (recv_all(sock, buffer, sizeof(buffer)) == 0) {
         printf("%s\n", buffer);
     }
 
     show_menu();
-    if (scanf("%d", &choice) != 1) {
+    read_line(input, sizeof(input));
+    if (sscanf(input, "%d", &choice) != 1) {
         close(sock);
         return 1;
     }
 
     memset(&req, 0, sizeof(req));
     req.type = choice;
-    snprintf(req.data, sizeof(req.data), "choice=%d", choice);
 
-    if (send(sock, &req, sizeof(req), 0) < 0) {
+    if (choice == 1 || choice == 2) {
+        printf("Username: ");
+        read_line(username, sizeof(username));
+
+        printf("Password: ");
+        read_line(password, sizeof(password));
+
+        snprintf(req.data, sizeof(req.data), "%s %s", username, password);
+    } else {
+        snprintf(req.data, sizeof(req.data), "choice=%d", choice);
+    }
+
+    if (send_all(sock, &req, sizeof(req)) < 0) {
         perror("send");
         close(sock);
         return 1;
+    }
+
+    memset(buffer, 0, sizeof(buffer));
+    if (recv_all(sock, buffer, sizeof(buffer)) == 0) {
+        printf("Server response: %s\n", buffer);
     }
 
     close(sock);
