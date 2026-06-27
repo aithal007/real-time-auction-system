@@ -1,1 +1,2 @@
-# ID ItemName Seller CurrentBid HighestBidder Status
+1 phone alice 100.00 0 0 2
+2 phoneSeller u1 10.00  0 0

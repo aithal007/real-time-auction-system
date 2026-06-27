@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include "bid_processor.h"
+#include "notification.h"
 #include "common.h"
 
 #define SERVER_PORT 8080
@@ -18,6 +19,7 @@ static pthread_mutex_t auction_lock = PTHREAD_MUTEX_INITIALIZER;
 static Auction auctions[MAX_AUCTIONS];
 static int auction_count = 0;
 static BidProcessor bid_processor;
+static NotificationProcessor notification_processor;
 
 typedef struct {
     int sock;
@@ -33,6 +35,15 @@ typedef struct {
     char bidder[MAX_USERNAME];
     float amount;
 } BidEntry;
+
+typedef struct {
+    char username[MAX_USERNAME];
+    char message[MAX_DATA];
+} NotificationEntry;
+
+static NotificationEntry notification_inbox[200];
+static int notification_inbox_count = 0;
+static pthread_mutex_t notification_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int send_all(int sock, const void *buffer, size_t length) {
     const char *ptr = (const char *)buffer;
@@ -72,6 +83,55 @@ static void send_response(int client_sock, const char *message) {
     if (send_all(client_sock, response, sizeof(response)) < 0) {
         perror("send");
     }
+}
+
+static void send_response_for_user(int client_sock, const char *username, const char *message) {
+    char response[MAX_DATA];
+    size_t offset = 0;
+    int i;
+
+    memset(response, 0, sizeof(response));
+
+    pthread_mutex_lock(&notification_lock);
+    for (i = 0; i < notification_inbox_count && offset < sizeof(response); i++) {
+        if (strcmp(notification_inbox[i].username, username) == 0) {
+            offset += (size_t)snprintf(response + offset, sizeof(response) - offset, "[NOTIF] %s\n", notification_inbox[i].message);
+            notification_inbox[i] = notification_inbox[notification_inbox_count - 1];
+            notification_inbox_count--;
+            i--;
+        }
+    }
+    pthread_mutex_unlock(&notification_lock);
+
+    if (offset < sizeof(response)) {
+        snprintf(response + offset, sizeof(response) - offset, "%s", message);
+    }
+
+    if (send_all(client_sock, response, sizeof(response)) < 0) {
+        perror("send");
+    }
+}
+
+static int notification_handler(const Notification *notif, void *ctx) {
+    (void)ctx;
+
+    pthread_mutex_lock(&notification_lock);
+    if (notification_inbox_count < 200) {
+        snprintf(notification_inbox[notification_inbox_count].username, sizeof(notification_inbox[notification_inbox_count].username), "%s", notif->username);
+        snprintf(notification_inbox[notification_inbox_count].message, sizeof(notification_inbox[notification_inbox_count].message), "%s", notif->message);
+        notification_inbox_count++;
+    }
+    pthread_mutex_unlock(&notification_lock);
+
+    return 1;
+}
+
+static void enqueue_notification(const char *username, const char *message) {
+    Notification notif;
+
+    snprintf(notif.username, sizeof(notif.username), "%s", username);
+    snprintf(notif.message, sizeof(notif.message), "%s", message);
+    notification_processor_submit(&notification_processor, &notif);
 }
 
 static void log_bid(int auction_id, const char *bidder, float amount) {
@@ -124,6 +184,7 @@ static int process_bid(const Bid *bid, void *ctx) {
     (void)ctx;
 
     int i = find_auction_index(bid->auction_id);
+    char previous_bidder[MAX_USERNAME];
 
     if (i < 0) {
         return -1;
@@ -134,10 +195,20 @@ static int process_bid(const Bid *bid, void *ctx) {
     }
 
     if (bid->amount > auctions[i].currentBid) {
+        memset(previous_bidder, 0, sizeof(previous_bidder));
+        if (auctions[i].highestBidder[0] != '\0') {
+            snprintf(previous_bidder, sizeof(previous_bidder), "%s", auctions[i].highestBidder);
+        }
+
         auctions[i].currentBid = bid->amount;
         snprintf(auctions[i].highestBidder, sizeof(auctions[i].highestBidder), "%s", bid->bidder);
         log_bid(bid->auction_id, bid->bidder, bid->amount);
         save_auctions(auctions, auction_count);
+
+        if (previous_bidder[0] != '\0' && strcmp(previous_bidder, bid->bidder) != 0) {
+            enqueue_notification(previous_bidder, "You have been outbid!");
+        }
+
         return 1;
     }
 
@@ -159,6 +230,7 @@ static void close_auction(int auction_id) {
         auctions[index].timeLeft = 0;
         save_auctions(auctions, auction_count);
         if (auctions[index].highestBidder[0] != '\0') {
+            enqueue_notification(auctions[index].highestBidder, "Congratulations! You won the auction!");
             printf("Auction %d closed. Winner: %s\n", auction_id, auctions[index].highestBidder);
         } else {
             printf("Auction %d closed with no bids\n", auction_id);
@@ -398,7 +470,7 @@ static void *handle_client(void *arg) {
                 memset(password, 0, sizeof(password));
                 if (sscanf(req.data, "%49s %49s", username, password) == 2) {
                     if (login_user(username, password)) {
-                        send_response(client_sock, "OK");
+                        send_response_for_user(client_sock, username, "OK");
                         printf("Login success for %s\n", username);
                     } else {
                         send_response(client_sock, "FAIL");
@@ -435,10 +507,10 @@ static void *handle_client(void *arg) {
                 if (sscanf(req.data, "%99s %49s %f %d", item, seller, &start_bid, &duration) == 4) {
                     pthread_mutex_lock(&auction_lock);
                     if (create_auction(auctions, &auction_count, item, seller, start_bid, duration)) {
-                        send_response(client_sock, "OK");
+                        send_response_for_user(client_sock, seller, "OK");
                         printf("Auction created: %s by %s\n", item, seller);
                     } else {
-                        send_response(client_sock, "FAIL");
+                        send_response_for_user(client_sock, seller, "FAIL");
                         printf("Failed to create auction for %s\n", item);
                     }
                     pthread_mutex_unlock(&auction_lock);
@@ -461,7 +533,7 @@ static void *handle_client(void *arg) {
                     int result = place_bid(auction_id, bidder, bid_amount);
 
                     if (result == 2) {
-                        send_response(client_sock, "QUEUED");
+                        send_response_for_user(client_sock, bidder, "QUEUED");
                         printf("Bid queued: %s on auction %d\n", bidder, auction_id);
                     } else {
                         send_response(client_sock, "FAIL");
@@ -537,6 +609,13 @@ int main(void) {
         return 1;
     }
 
+    if (!notification_processor_init(&notification_processor, notification_handler, NULL)) {
+        fprintf(stderr, "Failed to initialize notification processor\n");
+        bid_processor_destroy(&bid_processor);
+        close(server_fd);
+        return 1;
+    }
+
     pthread_mutex_lock(&auction_lock);
     auction_count = load_auctions(auctions, MAX_AUCTIONS);
     pthread_mutex_unlock(&auction_lock);
@@ -562,6 +641,15 @@ int main(void) {
 
     if (!bid_processor_start(&bid_processor)) {
         fprintf(stderr, "Failed to start bid processor\n");
+        notification_processor_destroy(&notification_processor);
+        bid_processor_destroy(&bid_processor);
+        close(server_fd);
+        return 1;
+    }
+
+    if (!notification_processor_start(&notification_processor)) {
+        fprintf(stderr, "Failed to start notification processor\n");
+        notification_processor_destroy(&notification_processor);
         bid_processor_destroy(&bid_processor);
         close(server_fd);
         return 1;
