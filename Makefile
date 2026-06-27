@@ -4,7 +4,7 @@ CFLAGS = -Wall -Wextra -std=c11
 all: server client
 
 server: server.c user_auth.c auction_io.c common.h
-	$(CC) $(CFLAGS) server.c user_auth.c auction_io.c -o server
+	$(CC) $(CFLAGS) server.c user_auth.c auction_io.c -o server -lpthread
 
 client: client.c common.h
 	$(CC) $(CFLAGS) client.c -o client
