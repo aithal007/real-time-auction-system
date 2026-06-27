@@ -20,6 +20,11 @@ typedef struct {
     int sock;
 } ThreadArgs;
 
+typedef struct {
+    int auction_id;
+    int duration;
+} TimerArgs;
+
 static int send_all(int sock, const void *buffer, size_t length) {
     const char *ptr = (const char *)buffer;
     size_t sent = 0;
@@ -58,6 +63,74 @@ static void send_response(int client_sock, const char *message) {
     if (send_all(client_sock, response, sizeof(response)) < 0) {
         perror("send");
     }
+}
+
+static int find_auction_index(int auction_id) {
+    int i;
+
+    for (i = 0; i < auction_count; i++) {
+        if (auctions[i].id == auction_id) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static void close_auction(int auction_id) {
+    int index = find_auction_index(auction_id);
+
+    if (index >= 0) {
+        auctions[index].status = 0;
+        auctions[index].timeLeft = 0;
+        save_auctions(auctions, auction_count);
+        if (auctions[index].highestBidder[0] != '\0') {
+            printf("Auction %d closed. Winner: %s\n", auction_id, auctions[index].highestBidder);
+        } else {
+            printf("Auction %d closed with no bids\n", auction_id);
+        }
+    }
+}
+
+static void *auction_timer(void *arg) {
+    TimerArgs *timer_args = (TimerArgs *)arg;
+    int auction_id = timer_args->auction_id;
+
+    free(timer_args);
+
+    while (1) {
+        sleep(1);
+
+        pthread_mutex_lock(&auction_lock);
+
+        if (auction_count == 0) {
+            pthread_mutex_unlock(&auction_lock);
+            break;
+        }
+
+        {
+            int index = find_auction_index(auction_id);
+
+            if (index < 0 || auctions[index].status == 0) {
+                pthread_mutex_unlock(&auction_lock);
+                break;
+            }
+
+            if (auctions[index].timeLeft > 0) {
+                auctions[index].timeLeft--;
+            }
+
+            if (auctions[index].timeLeft <= 0) {
+                close_auction(auction_id);
+                pthread_mutex_unlock(&auction_lock);
+                break;
+            }
+        }
+
+        pthread_mutex_unlock(&auction_lock);
+    }
+
+    return NULL;
 }
 
 static void view_auctions(int client_sock) {
@@ -161,21 +234,24 @@ static void view_winners(int client_sock) {
 }
 
 static int place_bid(int auction_id, const char *bidder, float amount) {
-    int i;
+    int i = find_auction_index(auction_id);
 
-    for (i = 0; i < auction_count; i++) {
-        if (auctions[i].id == auction_id) {
-            if (amount > auctions[i].currentBid) {
-                auctions[i].currentBid = amount;
-                snprintf(auctions[i].highestBidder, sizeof(auctions[i].highestBidder), "%s", bidder);
-                save_auctions(auctions, auction_count);
-                return 1;
-            }
-            return 0;
-        }
+    if (i < 0) {
+        return -1;
     }
 
-    return -1;
+    if (!auctions[i].status) {
+        return -2;
+    }
+
+    if (amount > auctions[i].currentBid) {
+        auctions[i].currentBid = amount;
+        snprintf(auctions[i].highestBidder, sizeof(auctions[i].highestBidder), "%s", bidder);
+        save_auctions(auctions, auction_count);
+        return 1;
+    }
+
+    return 0;
 }
 
 int create_auction(Auction auctions[], int *auction_count, const char *item, const char *seller, float start_bid, int duration) {
@@ -197,7 +273,26 @@ int create_auction(Auction auctions[], int *auction_count, const char *item, con
 
     (*auction_count)++;
 
-    return save_auctions(auctions, *auction_count);
+    if (!save_auctions(auctions, *auction_count)) {
+        return 0;
+    }
+
+    if (duration > 0) {
+        pthread_t timer_thread;
+        TimerArgs *timer_args = malloc(sizeof(*timer_args));
+
+        if (timer_args) {
+            timer_args->auction_id = new_id;
+            timer_args->duration = duration;
+            if (pthread_create(&timer_thread, NULL, auction_timer, timer_args) == 0) {
+                pthread_detach(timer_thread);
+            } else {
+                free(timer_args);
+            }
+        }
+    }
+
+    return 1;
 }
 
 static void *handle_client(void *arg) {
@@ -310,6 +405,9 @@ static void *handle_client(void *arg) {
                     } else if (result == 0) {
                         send_response(client_sock, "LOW_BID");
                         printf("Bid too low from %s on auction %d\n", bidder, auction_id);
+                    } else if (result == -2) {
+                        send_response(client_sock, "CLOSED");
+                        printf("Auction %d is already closed\n", auction_id);
                     } else {
                         send_response(client_sock, "NOT_FOUND");
                         printf("Auction %d not found for bid\n", auction_id);
@@ -381,6 +479,25 @@ int main(void) {
     pthread_mutex_lock(&auction_lock);
     auction_count = load_auctions(auctions, MAX_AUCTIONS);
     pthread_mutex_unlock(&auction_lock);
+
+    {
+        int i;
+        for (i = 0; i < auction_count; i++) {
+            if (auctions[i].status == 1 && auctions[i].timeLeft > 0) {
+                pthread_t timer_thread;
+                TimerArgs *timer_args = malloc(sizeof(*timer_args));
+                if (timer_args) {
+                    timer_args->auction_id = auctions[i].id;
+                    timer_args->duration = auctions[i].timeLeft;
+                    if (pthread_create(&timer_thread, NULL, auction_timer, timer_args) == 0) {
+                        pthread_detach(timer_thread);
+                    } else {
+                        free(timer_args);
+                    }
+                }
+            }
+        }
+    }
 
     printf("Server listening on port %d\n", SERVER_PORT);
 
